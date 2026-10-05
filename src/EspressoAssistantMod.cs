@@ -44,7 +44,7 @@ namespace EspressoAssistant
 
         public override void OnInitializeMelon()
         {
-            LoggerInstance.Msg("Espresso Assistant v1.1.0 loaded. F10 brews. F10 = brew.");
+            LoggerInstance.Msg("Espresso Assistant v1.1.0 loaded. Press F10 at the espresso machine.");
             LoggerInstance.Msg("Load a coffee grounds can and a cup first; the machine must read Ready.");
         }
 
