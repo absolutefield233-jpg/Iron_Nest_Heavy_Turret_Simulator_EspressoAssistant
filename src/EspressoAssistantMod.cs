@@ -4,167 +4,291 @@ using MelonLoader;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-[assembly: MelonInfo(typeof(EspressoAssistant.EspressoAssistantMod), "Espresso Assistant", "1.0.0", "4Dfish")]
+[assembly: MelonInfo(typeof(EspressoAssistant.EspressoAssistantMod), "Espresso Assistant", "1.1.0", "4Dfish")]
 [assembly: MelonGame("Iron Nest", "Iron Nest Heavy Turret Simulator")]
 
 namespace EspressoAssistant
 {
     /// <summary>
-    /// Brews a good espresso by working the machine the way a player would - moving the two
-    /// dials and pressing the button - while a PID loop holds temperature and pressure on target.
+    /// Brews a good espresso by working the machine the way a player would - moving the two dials
+    /// and clicking the brew handle - with a PID loop holding temperature and pressure on target.
     ///
-    /// The loop is needed because the dials only set a target: the machine decays temperature and
-    /// pressure and couples each to the other, so a dial set once drifts within seconds.
+    /// The loop runs in TWO STAGES with separate gains, because the machine behaves like two
+    /// different systems:
     ///
-    /// Before anything else the mod identifies the machine for itself. It parks the dials at their
-    /// base setting, samples how the readings sit, then steps each dial and samples the response.
-    /// That trace is written to the log, which is what the loop gains are worked out from - the
-    /// machine gets measured rather than guessed at, and nothing has to be brewed to do it.
+    ///   Warming - the dials are in charge. The readings follow them closely in both directions,
+    ///   so the only job is to arrive without swinging past the mark.
+    ///
+    ///   Brewing - the dials lose much of their authority. A shot brings its own heat and its own
+    ///   pressure, both pushing the readings up whatever the dials do, so this stage needs its own,
+    ///   stronger loop pulling the other way.
+    ///
+    /// Warming therefore parks both readings a little BELOW their ideals, so the shot's own push
+    /// carries them up onto the target instead of past it.
     /// </summary>
     public class EspressoAssistantMod : MelonMod
     {
-        /// <summary>F10 brews. F11 / F9 step the fallback gain preset.</summary>
+        /// <summary>F10 brews. No other key is taken.</summary>
         private const Key BrewKey = Key.F10;
 
-        // ---------------------------------------------------------------------------------
-        // Identification
-        // ---------------------------------------------------------------------------------
-
-        private enum IdPhase
+        public override void OnSceneWasLoaded(int buildIndex, string sceneName)
         {
-            Waiting,
-            SettleAtBase,
-            TempStep,
-            PressureStep,
-            Finished,
+            // A run cannot survive a scene change - the machine it was driving may not exist in the
+            // new one - so a half-finished warm-up is dropped rather than carried across.
+            if (_preheating || _brewing)
+            {
+                LoggerInstance.Msg("[ESPRESSO] Scene changed to '" + sceneName + "'; the shot in progress is abandoned.");
+            }
+            AbandonRun();
         }
-
-        private const float SettleSeconds = 3f;
-        private const float StepSeconds = 5f;
-        private const float StepFraction = 0.06f;
-        private const float SampleInterval = 0.2f;
-
-        private IdPhase _idPhase = IdPhase.Waiting;
-        private float _idPhaseTime;
-        private float _idSampleTimer;
-        private float _tempBaseDial;
-        private float _pressureBaseDial;
 
         public override void OnInitializeMelon()
         {
-            LoggerInstance.Msg("Espresso Assistant v1.0.0 loaded.");
-            LoggerInstance.Msg("F10 = brew. The machine identifies its own response first; watch for [IDENT] lines.");
+            LoggerInstance.Msg("Espresso Assistant v1.1.0 loaded. F10 brews. F10 = brew.");
+            LoggerInstance.Msg("Load a coffee grounds can and a cup first; the machine must read Ready.");
         }
 
-        // ---------------------------------------------------------------------------------
-        // Gains
-        // ---------------------------------------------------------------------------------
+        // =================================================================================
+        // Control gains - one set per stage
+        // =================================================================================
 
         private struct Gains
         {
-            public string Label;
-            public float TempKp;
-            public float TempKi;
-            public float TempKd;
-            public float PressureKp;
-            public float PressureKi;
-            public float PressureKd;
+            public float TempKp, TempKi, TempKd;
+            public float PressureKp, PressureKi, PressureKd;
+
+            /// <summary>
+            /// How much of the "dial reading equals the number on the dial" starting guess to use
+            /// before the loop's own correction is added. The guess is badly wrong on this machine:
+            /// a temperature dial of 47 holds 93 degrees and a pressure dial of 1.5 holds 9 bar, so
+            /// leaning on it whole keeps both dials far above where they need to be. Zero means
+            /// unset, which is read as 1 (the old behaviour) so untouched entries are unaffected.
+            /// </summary>
+            public float TempFf, PressureFf;
         }
 
-        private static readonly Gains FinalGains = new Gains
+        /// <summary>Reads a feed-forward factor, treating an unset field as 1.</summary>
+        private static float Ff(float value)
         {
-            Label = "final",
-            TempKp = 1.6f, TempKi = 3.5f, TempKd = 0.5f,
-            PressureKp = 16f, PressureKi = 1f, PressureKd = 0f,
+            return value > 0.0001f ? value : 1f;
+        }
+
+        /// <summary>
+        /// Warming. The dials rule here, so the loop only has to bring the readings down onto the
+        /// mark and keep them from swinging. Soft deliberately: a hard push overshoots and then has
+        /// to be undone, and that wobble is exactly what this stage must not have.
+        /// </summary>
+        /// <summary>
+        /// One test case: which gains the warming stage uses and which the brewing stage uses.
+        /// The list is laid out so that only ONE stage changes between neighbouring entries - the
+        /// first half walks the warming gains with the brewing ones held still, the second half
+        /// does the opposite. Since every shot logs both stages separately, one sweep therefore
+        /// tunes both without them getting tangled up in each other.
+        /// </summary>
+        private sealed class Candidate
+        {
+            public Gains Preheat;
+            public Gains Brew;
+
+            /// <summary>
+            /// Warming runs in two parts. While a reading is still further from its mark than the
+            /// corresponding lead, its dial is pinned wide open and the loop is out of the way;
+            /// that gets the reading up at the machine's own full speed, which no gain setting can
+            /// beat. Once both readings are inside their leads the loops take over and only have to
+            /// hold. The lead is the braking distance: the machine coasts a little after the dial
+            /// is pulled back, so handing over exactly at the mark always overshoots.
+            /// </summary>
+            public bool CoarsePhase;
+            public float TempLead;
+            public float PressureLead;
+
+            /// <summary>
+            /// Where warming should leave the readings, relative to the ideals. The temperature one
+            /// is the number this whole round is about: it sets the temperature the shot starts
+            /// from, and the shot then adds its own heat on top of that.
+            /// </summary>
+            public float PreheatTempOffset;
+            public float PreheatPressureOffset;
+
+        }
+
+        /// <summary>
+        /// The configuration. Every number in here was measured on the machine itself, one sweeps at a
+        /// time, and the notes say what each is for - none of them are guesses that can be nudged
+        /// without going back and measuring again.
+        /// </summary>
+        private static readonly Candidate Setup = new Candidate
+        {
+            // Warming runs in two parts. While a reading is further from its mark than its lead, that
+            // dial is held wide open: a dial against its stop is the machine's own fastest heating
+            // rate and no gain setting beats it. The loops then only trim the last stretch. The lead
+            // must stay small - hand over too early and the loops, whose starting guess sits near the
+            // holding value, crawl the remaining degrees.
+            CoarsePhase = true,
+            TempLead = 3f,
+            PressureLead = 0.8f,
+
+            // Warming parks both readings on the ideals rather than below them. Parking the pressure
+            // lower costs the whole of the first second of the shot while the pump climbs to the
+            // mark; parking it higher overshoots. The temperature behaves the same way.
+            PreheatTempOffset = 0f,
+            PreheatPressureOffset = 0f,
+
+            // TempFf / PressureFf scale the loop's starting guess, which assumes a dial showing N
+            // holds N of the reading. The real figures are about 0.70 of the reading for temperature
+            // while warming and 0.45 while brewing, and 0.15 for pressure. Left at 1 the guess parks
+            // both dials far too high, which is what used to make the shot overshoot.
+            Preheat = new Gains
+            {
+                TempKp = 1.2f, TempKi = 2.0f, TempKd = 1.0f,
+                PressureKp = 10f, PressureKi = 0.5f, PressureKd = 0.5f,
+                TempFf = 0.70f, PressureFf = 0.15f,
+            },
+            Brew = new Gains
+            {
+                TempKp = 108f, TempKi = 117f, TempKd = 58f,
+                PressureKp = 50f, PressureKi = 6f, PressureKd = 3f,
+                TempFf = 0.45f, PressureFf = 0.15f,
+            },
         };
 
-        private const float IntegralLimit = 200f;
 
-        /// <summary>
-        /// Low-pass on the derivative. The derivative is what stops the reading sailing past the
-        /// target - which matters here because temperature overshoot leaks straight into pressure
-        /// through the machine's coupling - but a raw derivative on a noisy reading is all spike,
-        /// so it is smoothed over this window first.
-        /// </summary>
+        private Gains PreheatGains
+        {
+            get { return Setup.Preheat; }
+        }
+
+        private Gains BrewGains
+        {
+            get { return Setup.Brew; }
+        }
+
+        private Candidate Current
+        {
+            get { return Setup; }
+        }
+
+
+        private const float IntegralLimit = 200f;
         private const float DerivativeFilterSeconds = 0.15f;
 
-        /// <summary>
-        /// How far above the ideal the machine is taken before a shot starts.
-        ///
-        /// Measured from a real brew: the moment the shot begins the temperature falls about
-        /// sixteen degrees and takes three seconds to climb back, so warming up TO the ideal
-        /// means the shot spends its first seconds cold. Standing the machine above the ideal by
-        /// roughly that drop puts the shock back on target instead of under it.
-        /// </summary>
-        /// <summary>How long the target takes to slide from the overshoot back to the ideal once a
-        /// shot begins. Stepping it instantly made the loop slam the handle shut.</summary>
-        private const float TargetRampSeconds = 4f;
+        // =================================================================================
+        // Stage targets
+        // =================================================================================
 
-        /// <summary>The warming-up stage stops early once the reading is this close, or after this
-        /// many seconds, rather than waiting for an exact figure - the machine cools very slowly
-        /// and waiting for precision there just burns time.</summary>
+        // Where each reading is parked before a shot starts now lives on the test case itself,
+        // because this round is about walking that number.
+
         private const float PreheatTempTolerance = 3f;
         private const float PreheatPressureTolerance = 0.5f;
-        private const float PreheatMaxSeconds = 45f;
 
-        // Measured on the machine: it heats at roughly 13 degrees a second and cools at about
-        // half a degree a second. Overshooting therefore pushes it somewhere it cannot come back
-        // from inside a twelve second shot, and the whole brew runs hot. The drop when a shot
-        // starts is better answered by the loop's own fast heating, so there is no overshoot.
         /// <summary>
-        /// Both readings are parked slightly BELOW their ideals before a shot. Pressure climbs on
-        /// its own once the pump runs, and temperature climbs too while the loop drives it up, so
-        /// starting low lets the shot carry both onto the target instead of over it.
+        /// Hand-over window, deliberately tighter than the coarse-run lead and tighter than the
+        /// tolerances above. When it was the same number the stage ended the moment a reading
+        /// clipped the edge of the band, so it parked a full tolerance short of where it had been
+        /// told to park and every shot began cold.
         /// </summary>
-        private const float PreheatOvershootTemp = -3f;
+        private const float SettleTempBand = 0.8f;
+        private const float SettlePressureBand = 0.25f;
+        private const float PreheatMaxSeconds = 25f;
 
-                /// <summary>
-        /// Lowered on purpose. Pressure settles about 0.3 bar above the ideal through a shot and
-        /// the handle cannot pull it back down once the pump is running, so the machine is warmed
-        /// BELOW the ideal instead and the shot carries it up onto the target. A first attempt at
-        /// -0.4 only bought 0.05 because the preheat's tolerance let it start at 8.9 without ever
-        /// reaching the figure, so the tolerance is tightened along with it.
+        /// <summary>How long a reading may sit perfectly still before the machine is called dead.</summary>
+        private const float PreheatStallSeconds = 3f;
+
+        /// <summary>How far from the mark a still reading has to be for that to mean anything.</summary>
+        private const float PreheatStallError = 10f;
+
+        /// <summary>
+        /// A gap between two frames longer than this means the game was paused, throttled or
+        /// unfocused. Game time cannot see that - it hands out small deltas throughout - so the
+        /// clock is used instead.
         /// </summary>
-        private const float PreheatOvershootPressure = -1.4f;
+        private const float PauseGapSeconds = 2f;
 
-        // ---------------------------------------------------------------------------------
+        /// <summary>
+        /// How long both readings must stay inside their tolerances before warming counts as done.
+        /// Without this the stage ends on the first frame that clips the edge of the band, which
+        /// hands a cold machine straight to the shot.
+        /// </summary>
+        private const float InBandHoldSeconds = 0.4f;
+
+        // =================================================================================
         // Runtime
-        // ---------------------------------------------------------------------------------
+        // =================================================================================
 
-        private bool _assistActive;
-        private bool _sawBrewing;
-        private bool _stopped;
-        private int _loggedDialInventory;
         private sealed class LoopState
         {
             public float Integral;
             public float PreviousError;
             public float Derivative;
             public bool HasPrevious;
+
+            public void Reset()
+            {
+                Integral = 0f;
+                PreviousError = 0f;
+                Derivative = 0f;
+                HasPrevious = false;
+            }
         }
 
         private readonly LoopState _tempLoop = new LoopState();
         private readonly LoopState _pressureLoop = new LoopState();
-        private int _controlLogFrames;
-
-        /// <summary>Kept on, the assistant brews by itself over and over and steps the preset each
-        /// time, so a set of gains can be judged from the log without anyone doing the brewing.</summary>
-        private bool _autoTest = false;
-        private DateTime _autoNextTryAt = DateTime.MinValue;
 
         private bool _preheating;
+        private bool _brewing;
+        private bool _sawBrewing;
+        private bool _stopped;
         private float _preheatElapsed;
         private float _preheatLogTimer;
+        private bool _suspended;
+        private bool _reportedBadReading;
+        private DateTime _lastFrameUtc = DateTime.MinValue;
+        private DateTime _lastReadingChangeUtc = DateTime.MinValue;
+        private float _lastSeenTemp;
+        private float _lastSeenPressure;
+        private float _tempDialClampSaved;
+        private float _pressureDialClampSaved;
+        private bool _clampSaved;
+        private int _controlLogFrames;
 
-        private float _tempAbsErrSum;
-        private float _tempMaxErr;
-        private float _pressureAbsErrSum;
-        private float _pressureMaxErr;
-        private int _errSamples;
+        private bool _coarseDone;
+        private float _inBandSeconds;
+        private int _runsCompleted;
+
+        // Last finished cup, kept purely so the panel can show it while the next one runs.
+        private bool _hasLastResult;
+        private float _lastQuality, _lastTempScore, _lastPressureScore, _lastTimingScore;
+        private float _lastBrewTempMean, _lastBrewTempMax, _lastBrewPressureMean, _lastBrewPressureMax;
+
+        // Per-stage error statistics, kept apart so a bad stage is obvious at a glance.
+        // Warming is judged as a step response, not a running average: an average taken from the
+        // moment F10 is pressed mostly measures how far the machine had to travel in the first
+        // place, which says nothing about the loop. What matters is how long it took to arrive,
+        // whether it sailed past on arrival, and how quietly it then sat there.
+        private float _preheatTempArrival = -1f;
+        private float _preheatPressureArrival = -1f;
+        private float _preheatTempOvershoot;          // past the mark, counted only after arriving
+        private float _preheatPressureOvershoot;
+        private float _preheatTailTempErr, _preheatTailPressureErr;   // rolling window
+        private int _preheatTailSamples;
+        private float _preheatTailTimer;
+        private float _preheatTailTempDone, _preheatTailPressureDone; // last completed 2s window
+        private int _preheatTailDoneSamples;
+        private int _preheatSamples;
+        private float _brewTempAbsErr, _brewTempMaxErr, _brewPressureAbsErr, _brewPressureMaxErr;
+        private int _brewSamples;
 
         public override void OnUpdate()
         {
             float dt = Time.deltaTime;
+
+            // Real time, not game time: a game that has been throttled still hands out small deltas
+            // throughout, so game time alone cannot tell that it stopped.
+            DateTime now = DateTime.UtcNow;
+            bool paused = _lastFrameUtc != DateTime.MinValue && (now - _lastFrameUtc).TotalSeconds > PauseGapSeconds;
+            bool focused = Application.isFocused;
+            _lastFrameUtc = now;
 
             Keyboard keyboard = Keyboard.current;
             if (keyboard != null && keyboard[BrewKey].wasPressedThisFrame)
@@ -180,292 +304,358 @@ namespace EspressoAssistant
 
             string state = StateOf(machine);
 
+            // Standing off. While the game is in the background the dials are left holding the current
+            // targets and nothing else is touched: left wide open the boiler runs away by the time the
+            // player is back, shut down it goes cold, and either way the shot is wasted. Left holding,
+            // a shot that was still good simply carries on where it left off.
+            if (_preheating || _brewing)
+            {
+                if (!focused || paused)
+                {
+                    if (!_suspended)
+                    {
+                        _suspended = true;
+                        LoggerInstance.Warning("[ESPRESSO] The game went to the background mid-shot. Standing off with " +
+                                               "the dials held where they are - the shot carries on when you are back.");
+                    }
+                    // Deliberately does NOT touch the dials. Writing them while the game is in the
+                    // background is one of the two things that differ between the build where the
+                    // machine survived a trip to the background and the one where it did not, and
+                    // this build exists to tell those two apart.
+                    _lastSeenTemp = safe(machine.simTemperature);
+                    _lastSeenPressure = safe(machine.simPressure);
+                    _lastReadingChangeUtc = now;      // time spent standing off is not a stall
+                    return;
+                }
+
+                if (_suspended)
+                {
+                    _suspended = false;
+                    LoggerInstance.Msg("[ESPRESSO] Back in the foreground; carrying on with the shot.");
+                }
+            }
+            else
+            {
+                _suspended = false;
+            }
+
+            // Remember whether the readings are still moving. A stopped machine reports exactly the
+            // same state and the same zeros as a cold one, so this is the only honest tell.
+            // The machine's own numbers going non-finite is the one failure that cannot be worked
+            // around: it never recovers, and only a fresh game clears it. Say so plainly instead of
+            // grinding away at a machine that is not there.
+            if ((_preheating || _brewing) && !_reportedBadReading &&
+                (IsBad(machine.simTemperature) || IsBad(machine.simPressure)))
+            {
+                _reportedBadReading = true;
+                LoggerInstance.Warning("[ESPRESSO] The machine's readings have gone non-finite (temp=" +
+                                       Raw(machine.simTemperature) + " pressure=" + Raw(machine.simPressure) +
+                                       "). Nothing can be done with it until the game is restarted - this is " +
+                                       "the machine's own state, not something the automation can clear.");
+                AbandonRun();
+                return;
+            }
+
+            float seenTemp = safe(machine.simTemperature);
+            float seenPressure = safe(machine.simPressure);
+            if (Math.Abs(seenTemp - _lastSeenTemp) > 0.5f || Math.Abs(seenPressure - _lastSeenPressure) > 0.05f)
+            {
+                _lastSeenTemp = seenTemp;
+                _lastSeenPressure = seenPressure;
+                _lastReadingChangeUtc = now;
+            }
+
             if (_preheating)
             {
-                if (state == "Brewing")
+                RunPreheat(machine, state, dt);
+                return;
+            }
+
+            if (_brewing)
+            {
+                RunBrew(machine, state, dt);
+                return;
+            }
+        }
+
+        // =================================================================================
+        // Stage 1 - warming
+        // =================================================================================
+
+        /// <summary>
+        /// Brings both readings to their parked positions, holds them there until they have
+        /// settled, then starts the shot.
+        /// </summary>
+        private void RunPreheat(EspressoBrewingController machine, string state, float dt)
+        {
+            if (state == "Brewing")
+            {
+                // Something started the shot underneath us; go straight to holding it.
+                _preheating = false;
+                EnterBrewStage();
+                return;
+            }
+
+            _preheatElapsed += dt;
+
+            float tempTarget = safe(machine.idealTemperature) + Current.PreheatTempOffset;
+            float pressureTarget = safe(machine.idealPressure) + Current.PreheatPressureOffset;
+            float tempErr = tempTarget - safe(machine.simTemperature);
+            float pressureErr = pressureTarget - safe(machine.simPressure);
+
+            // Coarse run. While a reading is still further from its mark than its lead, that dial is
+            // pinned wide open and the loop is kept out of it: the dial against its stop is the
+            // machine's own fastest heating rate, and no gain setting can beat it. The loop then has
+            // only the last stretch to trim, which is the part it is actually good at.
+            bool tempCoarse = false;
+            bool pressureCoarse = false;
+            if (Current.CoarsePhase && !_coarseDone)
+            {
+                tempCoarse = tempErr > Current.TempLead;
+                pressureCoarse = pressureErr > Current.PressureLead;
+                if (!tempCoarse && !pressureCoarse)
                 {
-                    // Something else started the shot; fall through to holding it.
-                    _preheating = false;
-                    _assistActive = true;
-                    _sawBrewing = true;
-                }
-                else
-                {
-                    _preheatElapsed += dt;
-                    KeepDialsAtIdeal(machine, PreheatOvershootTemp, PreheatOvershootPressure, dt);
-
-                    float tempGap = Math.Abs(safe(machine.idealTemperature) + PreheatOvershootTemp - safe(machine.simTemperature));
-                    float pressureGap = Math.Abs(safe(machine.idealPressure) + PreheatOvershootPressure - safe(machine.simPressure));
-
-                    _preheatLogTimer += dt;
-                    if (_preheatLogTimer >= 1f)
-                    {
-                        _preheatLogTimer = 0f;
-                        LoggerInstance.Msg("[PREHEAT] " + _preheatElapsed.ToString("0.0") + "s temp=" +
-                                           safe(machine.simTemperature).ToString("0.0") + "/" + (safe(machine.idealTemperature) + PreheatOvershootTemp).ToString("0.0") +
-                                           " (dial " + DialText(machine.temperatureDial) + ") pressure=" +
-                                           safe(machine.simPressure).ToString("0.000") + "/" + (safe(machine.idealPressure) + PreheatOvershootPressure).ToString("0.000") +
-                                           " (dial " + DialText(machine.pressureDial) + ")");
-                    }
-
-                    bool closeEnough = tempGap <= PreheatTempTolerance && pressureGap <= PreheatPressureTolerance;
-
-                    // No shortcut for "it is already warm": being above the target is not the same
-                    // as being on it, and the machine cools so slowly that a shot started hot stays
-                    // hot for its whole length. Only genuinely being on target counts.
-                    bool waited = _preheatElapsed >= PreheatMaxSeconds;
-
-                    if (closeEnough || waited)
-                    {
-                        _preheating = false;
-                        _assistActive = true;
-                        _sawBrewing = false;
-            _tempLoop.Integral = 0f;
-            _tempLoop.HasPrevious = false;
-            _tempLoop.Derivative = 0f;
-            _pressureLoop.Integral = 0f;
-            _pressureLoop.HasPrevious = false;
-            _pressureLoop.Derivative = 0f;
-
-                        _controlLogFrames = 0;
-                        _tempAbsErrSum = 0f;
-                        _tempMaxErr = 0f;
-                        _pressureAbsErrSum = 0f;
-                        _pressureMaxErr = 0f;
-                        _errSamples = 0;
-
-                        // The warming stage can leave a large integral behind; carrying it into
-                        // the shot is what made the handle slam shut right at the start.
-
-                        ClickBrewHandle(machine, true, "start");
-                        LoggerInstance.Msg("[PREHEAT] ready after " + _preheatElapsed.ToString("0.0") + "s at temp=" +
-                                           safe(machine.simTemperature).ToString("0.00") +
-                                           " pressure=" + safe(machine.simPressure).ToString("0.000") +
-                                           " (targets " + safe(machine.idealTemperature).ToString("0.00") + " / " +
-                                           (safe(machine.idealPressure) + PreheatOvershootPressure).ToString("0.000") +
-                                           ") - brewing with preset [" + FinalGains.Label + "].");
-                    }
-                    return;
+                    _coarseDone = true;
+                    _tempLoop.Reset();
+                    _pressureLoop.Reset();
+                    LoggerInstance.Msg("[PREHEAT] coarse run finished at " + _preheatElapsed.ToString("0.0") +
+                                       "s; handing both readings to the loop.");
                 }
             }
 
-            if (_assistActive)
+            Gains pGains = PreheatGains;
+
+            if (tempCoarse)
             {
-                if (state == "Brewing")
+                SetDialRaw(machine.temperatureDial, machine.temperatureDial != null ? machine.temperatureDial.maxOutputValue : 0f);
+            }
+            else
+            {
+                Control(machine.temperatureDial, tempTarget, safe(machine.simTemperature), safe(machine.tempMax),
+                        pGains.TempKp, pGains.TempKi, pGains.TempKd, _tempLoop, dt, Ff(pGains.TempFf));
+            }
+
+            if (pressureCoarse)
+            {
+                SetDialRaw(machine.pressureDial, machine.pressureDial != null ? machine.pressureDial.maxOutputValue : 0f);
+            }
+            else
+            {
+                Control(machine.pressureDial, pressureTarget, safe(machine.simPressure), safe(machine.pressureMax),
+                        pGains.PressureKp, pGains.PressureKi, pGains.PressureKd, _pressureLoop, dt, Ff(pGains.PressureFf));
+            }
+
+            _preheatSamples++;
+
+            float absTemp = Math.Abs(tempErr);
+            float absPressure = Math.Abs(pressureErr);
+
+            if (_preheatTempArrival < 0f && absTemp <= SettleTempBand) _preheatTempArrival = _preheatElapsed;
+            if (_preheatPressureArrival < 0f && absPressure <= SettlePressureBand) _preheatPressureArrival = _preheatElapsed;
+
+            // Overshoot only counts once the reading has been inside the band; before that a
+            // negative error just means "still climbing from below".
+            if (_preheatTempArrival >= 0f && tempErr < 0f && -tempErr > _preheatTempOvershoot) _preheatTempOvershoot = -tempErr;
+            if (_preheatPressureArrival >= 0f && pressureErr < 0f && -pressureErr > _preheatPressureOvershoot) _preheatPressureOvershoot = -pressureErr;
+
+            // Rolling 2s window; whatever it held when the stage ends is the settled behaviour.
+            _preheatTailTempErr += absTemp;
+            _preheatTailPressureErr += absPressure;
+            _preheatTailSamples++;
+            _preheatTailTimer += dt;
+            if (_preheatTailTimer >= 2f)
+            {
+                _preheatTailTimer = 0f;
+                _preheatTailTempDone = _preheatTailTempErr;
+                _preheatTailPressureDone = _preheatTailPressureErr;
+                _preheatTailDoneSamples = _preheatTailSamples;
+                _preheatTailTempErr = 0f;
+                _preheatTailPressureErr = 0f;
+                _preheatTailSamples = 0;
+            }
+
+            _preheatLogTimer += dt;
+            if (_preheatLogTimer >= 1f)
+            {
+                _preheatLogTimer = 0f;
+                LoggerInstance.Msg("[PREHEAT] " + _preheatElapsed.ToString("0.0") + "s temp=" +
+                                   safe(machine.simTemperature).ToString("0.00") + "/" + tempTarget.ToString("0.00") +
+                                   " (dial " + DialText(machine.temperatureDial) + ")" +
+                                   " pressure=" + safe(machine.simPressure).ToString("0.000") + "/" + pressureTarget.ToString("0.000") +
+                                   " (dial " + DialText(machine.pressureDial) + ")");
+            }
+
+            // A reading that has stopped moving while still a long way from the mark means the
+            // machine is no longer running. It must be a rolling window, not a "has it ever moved"
+            // flag: the machine works for a while and then stops, and only the recent past says so.
+            if (Math.Abs(tempErr) > PreheatStallError &&
+                (DateTime.UtcNow - _lastReadingChangeUtc).TotalSeconds >= PreheatStallSeconds)
+            {
+                LoggerInstance.Warning("[ESPRESSO] The reading has sat at " + safe(machine.simTemperature).ToString("0.00") +
+                                       " without moving, so the machine has stopped responding. Giving up without " +
+                                       "brewing and handing the dials back - press F10 again when it is running.");
+                AbandonRun();
+                return;
+            }
+
+            bool onTarget = Math.Abs(tempErr) <= SettleTempBand && Math.Abs(pressureErr) <= SettlePressureBand;
+            _inBandSeconds = onTarget ? _inBandSeconds + dt : 0f;
+
+            // Running out of time is not a reason to brew. If warming could not reach the mark in
+            // this long then something is wrong with the machine, and pressing the handle anyway
+            // only ruins a cup.
+            if (_preheatElapsed >= PreheatMaxSeconds)
+            {
+                LoggerInstance.Warning("[ESPRESSO] Warming did not settle within " + PreheatMaxSeconds +
+                                       "s (stuck near " + safe(machine.simTemperature).ToString("0.00") +
+                                       " of " + tempTarget.ToString("0.00") + "). Giving up without brewing.");
+                AbandonRun();
+                return;
+            }
+
+            if (onTarget && _inBandSeconds >= InBandHoldSeconds)
+            {
+                // Checked again here, not just when F10 was pressed: the cup can come out during the
+                // warm-up, and pressing the handle then just wastes the heat.
+                string gone = MissingSupplies(machine);
+                if (gone.Length > 0)
                 {
-                    _sawBrewing = true;
-                    // Slide the target down instead of stepping it: the shot is already cooling
-                    // the machine, so the loop only has to guide it to the ideal, not force it.
-                    float blend = safe(machine.BrewElapsedSeconds) / TargetRampSeconds;
-                    if (blend > 1f) blend = 1f;
-                    if (blend < 0f) blend = 0f;
-
-                    KeepDialsAtIdeal(machine, PreheatOvershootTemp * (1f - blend),
-                                     PreheatOvershootPressure * (1f - blend), dt);
-                    TrackError(machine);
-
-                    // Release the handle once the gauge has run out the ideal time - in normal
-                    // play that second press is what stops and scores the shot.
-                    if (!_stopped && safe(machine.BrewElapsedSeconds) >= safe(machine.idealBrewSeconds))
-                    {
-                        _stopped = true;
-                        ClickBrewHandle(machine, false, "stop");
-
-                        // Park the dials low once the shot is over. The machine only loses pressure
-                        // slowly, so starting that bleed immediately means the next preheat does not
-                        // have to sit through it.
-                        SetDialRaw(machine.temperatureDial, machine.temperatureDial != null ? machine.temperatureDial.minOutputValue : 0f);
-                        SetDialRaw(machine.pressureDial, machine.pressureDial != null ? machine.pressureDial.minOutputValue : 0f);
-                        LoggerInstance.Msg("[ESPRESSO] stopping at " + safe(machine.BrewElapsedSeconds).ToString("0.00") +
-                                           "s (ideal " + safe(machine.idealBrewSeconds).ToString("0.00") + "s).");
-                    }
-
-                    _controlLogFrames++;
-                    if (_controlLogFrames % 30 == 1)
-                    {
-                        LoggerInstance.Msg("[ESPRESSO] t=" + machine.BrewElapsedSeconds.ToString("0.0") +
-                                           "s temp=" + safe(machine.simTemperature).ToString("0.00") + "/" + safe(machine.idealTemperature).ToString("0.00") +
-                                           " (handle " + DialText(machine.temperatureDial) + ")" +
-                                           " | pressure=" + safe(machine.simPressure).ToString("0.000") + "/" + safe(machine.idealPressure).ToString("0.000") +
-                                           " (handle " + DialText(machine.pressureDial) + ")");
-                    }
+                    LoggerInstance.Warning("[ESPRESSO] " + gone + " went missing during the warm-up; stopping here " +
+                                           "rather than brewing into nothing. Load it and press F10 again.");
+                    AbandonRun();
                     return;
                 }
 
+                LoggerInstance.Msg("[PREHEAT] arrive temp=" + Arrival(_preheatTempArrival) +
+                                   " pressure=" + Arrival(_preheatPressureArrival) +
+                                   " | overshoot temp=" + _preheatTempOvershoot.ToString("0.00") +
+                                   " pressure=" + _preheatPressureOvershoot.ToString("0.000") +
+                                   " | settled(2s) temp=" + Mean(_preheatTailTempDone, _preheatTailDoneSamples).ToString("0.00") +
+                                   " pressure=" + Mean(_preheatTailPressureDone, _preheatTailDoneSamples).ToString("0.000") +
+                                   " | parked " + safe(machine.simTemperature).ToString("0.00") +
+                                   " want " + tempTarget.ToString("0.00") +
+                                   " | total " + _preheatElapsed.ToString("0.0") + "s");
+
+                _preheating = false;
+                EnterBrewStage();
+                ClickBrewHandle(machine, true, "start");
+            }
+        }
+
+        // =================================================================================
+        // Stage 2 - brewing
+        // =================================================================================
+
+        private void RunBrew(EspressoBrewingController machine, string state, float dt)
+        {
+            if (state != "Brewing")
+            {
                 if (_sawBrewing)
                 {
-                    _sawBrewing = false;
-                    _assistActive = false;
+                    _brewing = false;
+
+                    // If the automation did not press the handle off itself, then the machine ended
+                    // the brew on its own - and the one way that happens is the cup being taken away.
+                    // The lever is then certainly still down, so put it back. The missing supplies
+                    // also make this the safe moment to risk a click: with nothing to brew into, a
+                    // click that landed the wrong way cannot start a shot.
+                    if (!_stopped && MissingSupplies(machine).Length > 0)
+                    {
+                        ResetBrewHandle(machine);
+                    }
+                    _stopped = true;
+
                     ReportResult(machine);
+                    _runsCompleted++;
 
-                    _tempLoop.Integral = 0f;
-                    _tempLoop.HasPrevious = false;
-                    _tempLoop.Derivative = 0f;
-                    _pressureLoop.Integral = 0f;
-                    _pressureLoop.HasPrevious = false;
-                    _pressureLoop.Derivative = 0f;
-                    return;
+                    // Park both dials so the pressure the shot built up starts bleeding off at once,
+                    // which is what makes the next shot warm up quickly. The cup is left exactly where
+                    // it is - the drink belongs to the player and is never touched.
+                    SetDialRaw(machine.temperatureDial, machine.temperatureDial != null ? machine.temperatureDial.minOutputValue : 0f);
+                    SetDialRaw(machine.pressureDial, machine.pressureDial != null ? machine.pressureDial.minOutputValue : 0f);
+                    RestoreDialCentre(machine);
                 }
-            }
-
-            // Nothing brewing: identify the machine first, then keep shots coming by itself.
-            if (_idPhase != IdPhase.Finished && state != "Brewing")
-            {
-                RunIdentification(machine, dt);
                 return;
             }
 
-            if (!_autoTest || _preheating || _assistActive || state == "Brewing")
+            _sawBrewing = true;
+
+            // The shot is worth nothing without its cup. The game usually ends the brew by itself when
+            // the cup goes, but if it has not, stop it - and either way the lever must not be left
+            // down.
+            if (!_stopped && MissingSupplies(machine).Length > 0)
             {
+                _stopped = true;
+                LoggerInstance.Warning("[ESPRESSO] The cup or the grounds were taken away mid-shot; stopping the brew " +
+                                       "and putting the handle back.");
+                ClickBrewHandle(machine, false, "stop (supplies removed)");
                 return;
             }
 
-            if (DateTime.UtcNow < _autoNextTryAt)
+            // The same tell as in warming, and the same answer. A shot cannot be rescued once the
+            // machine has stopped, so it is dropped rather than kept pressing at a dead handle.
+            if (Math.Abs(safe(machine.idealTemperature) - safe(machine.simTemperature)) > PreheatStallError &&
+                (DateTime.UtcNow - _lastReadingChangeUtc).TotalSeconds >= PreheatStallSeconds)
             {
+                LoggerInstance.Warning("[ESPRESSO] The machine stopped responding part way through the shot. " +
+                                       "Giving up on it - this cup is lost, press F10 when the machine is back.");
+                AbandonRun();
                 return;
             }
 
-            if (state == "Ready")
+            ApplyStage(machine, BrewGains, 0f, 0f, dt);
+
+            float tempErr = safe(machine.idealTemperature) - safe(machine.simTemperature);
+            float pressureErr = safe(machine.idealPressure) - safe(machine.simPressure);
+            _brewTempAbsErr += Math.Abs(tempErr);
+            _brewPressureAbsErr += Math.Abs(pressureErr);
+            if (Math.Abs(tempErr) > _brewTempMaxErr) _brewTempMaxErr = Math.Abs(tempErr);
+            if (Math.Abs(pressureErr) > _brewPressureMaxErr) _brewPressureMaxErr = Math.Abs(pressureErr);
+            _brewSamples++;
+
+            _controlLogFrames++;
+            if (_controlLogFrames % 60 == 1)
             {
-                BeginAssist();
-                return;
+                LoggerInstance.Msg("[BREW] t=" + safe(machine.BrewElapsedSeconds).ToString("0.0") +
+                                   "s temp=" + safe(machine.simTemperature).ToString("0.00") + "/" + safe(machine.idealTemperature).ToString("0.00") +
+                                   " (dial " + DialText(machine.temperatureDial) + ")" +
+                                   " pressure=" + safe(machine.simPressure).ToString("0.000") + "/" + safe(machine.idealPressure).ToString("0.000") +
+                                   " (dial " + DialText(machine.pressureDial) + ")");
             }
 
-            // Not ready. Try to put a cup back in the machine so the next shot can start; if
-            // there is no cup to be had, say so once and stop rather than spinning.
-            if (TryReloadCup(machine))
+            if (!_stopped && safe(machine.BrewElapsedSeconds) >= safe(machine.idealBrewSeconds))
             {
-                _autoNextTryAt = DateTime.UtcNow.AddSeconds(1.5);
-                return;
-            }
+                _stopped = true;
+                ClickBrewHandle(machine, false, "stop");
 
-            _autoTest = false;
-            LoggerInstance.Msg("[AUTO] no cup available - automatic testing stopped after this run. " +
-                               "Put a few cups next to the machine to let it sweep the presets.");
+                // Park the dials so the pressure the shot built up starts bleeding off straight
+                // away; that is what lets the next warm-up be quick.
+                SetDialRaw(machine.temperatureDial, machine.temperatureDial != null ? machine.temperatureDial.minOutputValue : 0f);
+                SetDialRaw(machine.pressureDial, machine.pressureDial != null ? machine.pressureDial.minOutputValue : 0f);
+            }
         }
-
-        // ---------------------------------------------------------------------------------
-        // Identification routine
-        // ---------------------------------------------------------------------------------
 
         /// <summary>
-        /// Measures how the machine answers the dials. Both dials are parked at their base setting
-        /// for a settling period, then one dial is stepped and the readings are sampled for a few
-        /// seconds, then the other. The samples are the plant's step response.
-        /// </summary>
-        private void RunIdentification(EspressoBrewingController machine, float dt)
-        {
-            DialInteractable tempDial = machine.temperatureDial;
-            DialInteractable pressureDial = machine.pressureDial;
-            if (tempDial == null || pressureDial == null)
-            {
-                _idPhase = IdPhase.Finished;
-                return;
-            }
-
-            if (_idPhase == IdPhase.Waiting)
-            {
-                _tempBaseDial = BaseDialValue(tempDial, machine.IdealTempMapped);
-                _pressureBaseDial = BaseDialValue(pressureDial, machine.IdealPressureMapped);
-
-                LoggerInstance.Msg("[IDENT] machine constants: tempMax=" + safe(machine.tempMax).ToString("0.00") +
-                                   " pressureMax=" + safe(machine.pressureMax).ToString("0.000") +
-                                   " tempInputScale=" + safe(machine.tempInputScale).ToString("0.00") +
-                                   " pressureInputScale=" + safe(machine.pressureInputScale).ToString("0.00") +
-                                   " thermalWarmup=" + safe(machine.thermalWarmupDuration).ToString("0.00") +
-                                   " tempDecayCold=" + safe(machine.tempDecayRateCold).ToString("0.000") +
-                                   " tempDecayWarm=" + safe(machine.tempDecayRateWarmed).ToString("0.000") +
-                                   " pressureDecay=" + safe(machine.pressureDecayRate).ToString("0.000") +
-                                   " tempToPressure=" + safe(machine.tempToPressureCoupling).ToString("0.000") +
-                                   " pressureToTemp=" + safe(machine.pressureToTempCoupling).ToString("0.000") +
-                                   " tempDialMax=" + safe(machine.tempDialMaxOutput).ToString("0.00") +
-                                   " pressureDialMax=" + safe(machine.pressureDialMaxOutput).ToString("0.00"));
-
-                LoggerInstance.Msg("[IDENT] dial ranges: temp=[" + safe(tempDial.minOutputValue).ToString("0.00") + ".." + safe(tempDial.maxOutputValue).ToString("0.00") + "]" +
-                                   " pressure=[" + safe(pressureDial.minOutputValue).ToString("0.00") + ".." + safe(pressureDial.maxOutputValue).ToString("0.00") + "]" +
-                                   " | base dial temp=" + _tempBaseDial.ToString("0.00") + " pressure=" + _pressureBaseDial.ToString("0.00"));
-
-                _idPhase = IdPhase.SettleAtBase;
-                _idPhaseTime = 0f;
-                _idSampleTimer = 0f;
-            }
-
-            _idPhaseTime += dt;
-
-            switch (_idPhase)
-            {
-                case IdPhase.SettleAtBase:
-                    SetDialRaw(tempDial, _tempBaseDial);
-                    SetDialRaw(pressureDial, _pressureBaseDial);
-                    Sample(machine, "settle", dt);
-                    if (_idPhaseTime >= SettleSeconds)
-                    {
-                        Advance(ref _idPhase, IdPhase.TempStep);
-                    }
-                    break;
-
-                case IdPhase.TempStep:
-                    SetDialRaw(tempDial, _tempBaseDial + StepFraction * (tempDial.maxOutputValue - tempDial.minOutputValue));
-                    SetDialRaw(pressureDial, _pressureBaseDial);
-                    Sample(machine, "tempStep", dt);
-                    if (_idPhaseTime >= StepSeconds)
-                    {
-                        Advance(ref _idPhase, IdPhase.PressureStep);
-                    }
-                    break;
-
-                case IdPhase.PressureStep:
-                    SetDialRaw(tempDial, _tempBaseDial);
-                    SetDialRaw(pressureDial, _pressureBaseDial + StepFraction * (pressureDial.maxOutputValue - pressureDial.minOutputValue));
-                    Sample(machine, "pressureStep", dt);
-                    if (_idPhaseTime >= StepSeconds)
-                    {
-                        SetDialRaw(tempDial, _tempBaseDial);
-                        SetDialRaw(pressureDial, _pressureBaseDial);
-                        _idPhase = IdPhase.Finished;
-                        LoggerInstance.Msg("[IDENT] done. Send the log and the gains can be worked out from the trace.");
-                    }
-                    break;
-            }
-        }
-
-        private static void Advance(ref IdPhase phase, IdPhase next)
-        {
-            phase = next;
-        }
-
-        private void Sample(EspressoBrewingController machine, string phase, float dt)
-        {
-            _idSampleTimer += dt;
-            if (_idSampleTimer < SampleInterval)
-            {
-                return;
-            }
-            _idSampleTimer = 0f;
-
-            LoggerInstance.Msg("[IDENT] " + phase +
-                               " t=" + _idPhaseTime.ToString("0.0") +
-                               " tempSim=" + safe(machine.simTemperature).ToString("0.0000") +
-                               " tempMapped=" + safe(machine.MappedTemperature).ToString("0.0000") +
-                               " tempDial=" + DialText(machine.temperatureDial) +
-                               " | pressSim=" + safe(machine.simPressure).ToString("0.0000") +
-                               " pressMapped=" + safe(machine.MappedPressure).ToString("0.0000") +
-                               " pressDial=" + DialText(machine.pressureDial));
-        }
-
-        // ---------------------------------------------------------------------------------
-        // Brewing
-        // ---------------------------------------------------------------------------------
-
-
-        /// <summary>
-        /// Starts the machine warming rather than brewing straight away.
+        /// Clears the machine for the next shot WITHOUT throwing the coffee away.
         ///
-        /// The machine is cold and takes about ten seconds to come up to heat, while a shot lasts
-        /// twelve - starting the shot immediately means the temperature never reaches the ideal and
-        /// no amount of loop gain can fix that. So the dials are set and the machine is left to
-        /// warm until the readings are actually on target, and only then does the shot begin.
+        /// The finished cup is taken off the machine exactly as a player would take it - coffee and
+        /// all, so it can still be drunk - and an empty spare is put in its place. An earlier
+        /// version emptied the cup in place instead, which quietly destroyed the drink.
         /// </summary>
+        /// <summary>Switches the loop over to the brewing gains and targets.</summary>
+        private void EnterBrewStage()
+        {
+            _brewing = true;
+            _sawBrewing = false;
+            _stopped = false;
+            _controlLogFrames = 0;
+
+            // Nothing carries over between stages: the warming integral describes a machine the
+            // shot has just changed, and carrying it in would skew the first seconds badly.
+            _tempLoop.Reset();
+            _pressureLoop.Reset();
+        }
+
         private void BeginAssist()
         {
             EspressoBrewingController machine = FindMachine();
@@ -475,12 +665,10 @@ namespace EspressoAssistant
                 return;
             }
 
-            LogDialInventory(machine);
-
             string state = StateOf(machine);
             if (state == "Brewing")
             {
-                LoggerInstance.Msg("[ESPRESSO] Already brewing; the assistant is holding the dials.");
+                LoggerInstance.Msg("[ESPRESSO] Already brewing; holding the dials.");
                 return;
             }
             if (state != "Ready")
@@ -489,183 +677,140 @@ namespace EspressoAssistant
                 return;
             }
 
-            _assistActive = false;
+            string missing = MissingSupplies(machine);
+            if (missing.Length > 0)
+            {
+                LoggerInstance.Warning("[ESPRESSO] The machine has no " + missing +
+                                       " in it - load it and press F10 again.");
+                return;
+            }
+
             _preheating = true;
+            _brewing = false;
+            _sawBrewing = false;
+            _stopped = false;
             _preheatElapsed = 0f;
             _preheatLogTimer = 1f;
-            _stopped = false;
+            _preheatTempArrival = -1f;
+            _preheatPressureArrival = -1f;
+            _preheatTempOvershoot = 0f;
+            _preheatPressureOvershoot = 0f;
+            _preheatTailTempErr = _preheatTailPressureErr = 0f;
+            _preheatTailSamples = 0;
+            _preheatTailTimer = 0f;
+            _preheatTailTempDone = _preheatTailPressureDone = 0f;
+            _preheatTailDoneSamples = 0;
+            _preheatSamples = 0;
+            _brewTempAbsErr = _brewTempMaxErr = _brewPressureAbsErr = _brewPressureMaxErr = 0f;
+            _brewSamples = 0;
+            _tempLoop.Reset();
+            _pressureLoop.Reset();
 
-            _tempLoop.Integral = 0f;
-            _tempLoop.HasPrevious = false;
-            _tempLoop.Derivative = 0f;
-            _pressureLoop.Integral = 0f;
-            _pressureLoop.HasPrevious = false;
-            _pressureLoop.Derivative = 0f;
+            float tempTarget = safe(machine.idealTemperature) + Current.PreheatTempOffset;
+            float pressureTarget = safe(machine.idealPressure) + Current.PreheatPressureOffset;
 
-            _controlLogFrames = 0;
-            _tempAbsErrSum = 0f;
-            _tempMaxErr = 0f;
-            _pressureAbsErrSum = 0f;
-            _pressureMaxErr = 0f;
-            _errSamples = 0;
+            // Loading a cup resets both dials to the top of their travel, so warming would otherwise
+            // open from the worst possible position. Park them at the bottom and let the stage drive
+            // up from there.
+            _coarseDone = false;
+            _inBandSeconds = 0f;
+            _lastSeenTemp = safe(machine.simTemperature);
+            _lastSeenPressure = safe(machine.simPressure);
+            _lastReadingChangeUtc = DateTime.UtcNow;
 
-            float tempMax = safe(machine.tempMax);
-            float pressureMax = safe(machine.pressureMax);
-            float tempTargetMapped = tempMax > 0.0001f ? (safe(machine.idealTemperature) + PreheatOvershootTemp) / tempMax : 0f;
-            float pressureTargetMapped = pressureMax > 0.0001f ? (safe(machine.idealPressure) + PreheatOvershootPressure) / pressureMax : 0f;
+            // Driving a dial means writing its clamp centre, and the game uses that field to decide
+            // how far the dial's output range may reach. It is remembered here so the machine is not
+            // left with a value this mod happened to leave behind.
+            _tempDialClampSaved = machine.temperatureDial != null ? safe(machine.temperatureDial.clampCenterValue) : 0f;
+            _pressureDialClampSaved = machine.pressureDial != null ? safe(machine.pressureDial.clampCenterValue) : 0f;
+            _clampSaved = true;
+            SetDialRaw(machine.temperatureDial, machine.temperatureDial != null ? machine.temperatureDial.minOutputValue : 0f);
+            SetDialRaw(machine.pressureDial, machine.pressureDial != null ? machine.pressureDial.minOutputValue : 0f);
 
-            SetDialRaw(machine.temperatureDial, BaseDialValue(machine.temperatureDial, tempTargetMapped));
-            SetDialRaw(machine.pressureDial, BaseDialValue(machine.pressureDial, pressureTargetMapped));
-
-            LoggerInstance.Msg("[PREHEAT] warming up to temp=" + safe(machine.idealTemperature).ToString("0.0") +
-                               " pressure=" + safe(machine.idealPressure).ToString("0.000") +
-                               " before the shot starts.");
+            LoggerInstance.Msg("[PREHEAT] warming to temp=" + tempTarget.ToString("0.0") +
+                               " pressure=" + pressureTarget.ToString("0.000") +
+                               " | coarse " + (Current.CoarsePhase
+                                   ? Current.TempLead.ToString("0.#") + "C/" + Current.PressureLead.ToString("0.##") + "b"
+                                   : "off"));
         }
+
+        // =================================================================================
+        // The loop
+        // =================================================================================
 
         /// <summary>
-        /// Clicks the brew handle the way the game's own cursor would.
-        ///
-        /// Setting the handle's active flag only changed how the handle looked and left the
-        /// machine alone - a shot "started" that way did not begin until the handle was clicked by
-        /// hand nearly half a minute later. So the handle is now hovered and clicked through the
-        /// same entry points the cursor manager uses, and whatever the game has wired to the
-        /// handle runs by itself. One click starts a shot and the next one stops it, exactly as
-        /// it does for a player.
+        /// Drives both dials for the current stage. The offsets shift the targets below the ideals;
+        /// they are zero while brewing.
         /// </summary>
-        private void ClickBrewHandle(EspressoBrewingController machine, bool wantBrewing, string why)
-        {
-            LookAtTarget handle = machine.brewButton;
-            if (handle == null)
-            {
-                LoggerInstance.Warning("[ESPRESSO] Brew handle not found; cannot " + why + ".");
-                return;
-            }
-
-            // The handle is a latching switch whose own state can drift out of step with the
-            // machine - it is a toggle, so a click made while it is already where we want it does
-            // the opposite. The machine's own state is the authority, so what is wanted is checked
-            // against that first and the click is skipped when there is nothing to do.
-            string before = StateOf(machine);
-            bool brewing = before == "Brewing";
-
-            if (brewing == wantBrewing)
-            {
-                LoggerInstance.Msg("[ESPRESSO] no click needed (" + why + "): machine already " + before +
-                                   ", handle isActive=" + handle.isActive);
-                return;
-            }
-
-            try
-            {
-                Interactable target = handle.interactable;
-
-                for (int attempt = 1; attempt <= 3; attempt++)
-                {
-                    handle.UpdateHover(true, true);
-                    handle.HandleClickDownFromManager(target);
-                    handle.HandleClickUpFromManager(target);
-
-                    string after = StateOf(machine);
-                    bool nowBrewing = after == "Brewing";
-                    LoggerInstance.Msg("[ESPRESSO] click " + attempt + " (" + why + "): " + before +
-                                       " -> " + after + ", handle isActive=" + handle.isActive);
-
-                    if (nowBrewing == wantBrewing)
-                    {
-                        return;
-                    }
-                }
-
-                LoggerInstance.Warning("[ESPRESSO] the handle would not " + why +
-                                       " after three clicks (" + StateOf(machine) + ").");
-            }
-            catch (Exception e)
-            {
-                LoggerInstance.Error("[ESPRESSO] Could not click the brew handle: " + e);
-            }
-        }
-
-        /// <summary>
-        /// Puts a spare cup back into the machine's cup slot so the next shot can run. Finds a cup
-        /// lying around and hands it to the slot through the slot's own PlaceItem.
-        /// </summary>
-        private bool TryReloadCup(EspressoBrewingController machine)
-        {
-            try
-            {
-                ItemSlot slot = machine.cupSlot;
-                if (slot == null)
-                {
-                    return false;
-                }
-
-                // A cup full of coffee keeps the machine out of Ready, and the cup that is
-                // already sitting in the slot is the one that just got filled. Emptying it is
-                // what lets the next shot start - no need to take it off the machine at all.
-                if (slot.HasItem)
-                {
-                    // Never empties the cup: that would throw the player's coffee away.
-                    return machine._loadedCup != null;
-                }
-
-                foreach (EspressoCup cup in Resources.FindObjectsOfTypeAll<EspressoCup>())
-                {
-                    if (cup == null || cup.gameObject == null || cup._draggable == null)
-                    {
-                        continue;
-                    }
-
-                    slot.PlaceItem(cup._draggable);
-                    LoggerInstance.Msg("[AUTO] put an emptied spare cup into the machine.");
-                    return true;
-                }
-
-                return false;
-            }
-            catch (Exception e)
-            {
-                LoggerInstance.Warning("[AUTO] could not reload a cup: " + e.Message);
-                return false;
-            }
-        }
-
-        private void TrackError(EspressoBrewingController machine)
-        {
-            float tempError = Math.Abs(safe(machine.idealTemperature) - safe(machine.simTemperature));
-            float pressureError = Math.Abs(safe(machine.idealPressure) - safe(machine.simPressure));
-
-            _tempAbsErrSum += tempError;
-            _pressureAbsErrSum += pressureError;
-            if (tempError > _tempMaxErr) _tempMaxErr = tempError;
-            if (pressureError > _pressureMaxErr) _pressureMaxErr = pressureError;
-            _errSamples++;
-        }
-
-        /// <summary>
-        /// Holds both readings on their targets. The targets carry an overshoot while the machine
-        /// is warming and none once the shot is running, so the shock of starting lands on ideal.
-        /// </summary>
-        private void KeepDialsAtIdeal(EspressoBrewingController machine, float tempOvershoot, float pressureOvershoot, float dt)
+        private void ApplyStage(EspressoBrewingController machine, Gains gains,
+                                float tempOffset, float pressureOffset, float dt)
         {
             if (dt <= 0f || dt > 0.25f)
             {
                 dt = 0.02f;
             }
 
-            Gains gains = FinalGains;
+            float tempTarget = safe(machine.idealTemperature) + tempOffset;
+            float pressureTarget = safe(machine.idealPressure) + pressureOffset;
 
-            float tempTarget = safe(machine.idealTemperature) + tempOvershoot;
-            float pressureTarget = safe(machine.idealPressure) + pressureOvershoot;
-
-            Control(machine.temperatureDial, tempTarget, safe(machine.simTemperature),
-                    safe(machine.tempMax), gains.TempKp, gains.TempKi, gains.TempKd, _tempLoop, dt);
-            Control(machine.pressureDial, pressureTarget, safe(machine.simPressure),
-                    safe(machine.pressureMax), gains.PressureKp, gains.PressureKi, gains.PressureKd, _pressureLoop, dt);
+            Control(machine.temperatureDial, tempTarget, safe(machine.simTemperature), safe(machine.tempMax),
+                    gains.TempKp, gains.TempKi, gains.TempKd, _tempLoop, dt, Ff(gains.TempFf));
+            Control(machine.pressureDial, pressureTarget, safe(machine.simPressure), safe(machine.pressureMax),
+                    gains.PressureKp, gains.PressureKi, gains.PressureKd, _pressureLoop, dt, Ff(gains.PressureFf));
         }
 
-        // ---------------------------------------------------------------------------------
+        private static void Control(DialInteractable dial, float target, float actual, float readingMax,
+                                    float kp, float ki, float kd, LoopState loop, float dt, float feedForward)
+        {
+            if (dial == null)
+            {
+                return;
+            }
+
+            float error = target - actual;
+
+            float rawDerivative = loop.HasPrevious ? (error - loop.PreviousError) / dt : 0f;
+            loop.PreviousError = error;
+            loop.HasPrevious = true;
+            float alpha = dt / (DerivativeFilterSeconds + dt);
+            loop.Derivative += alpha * (rawDerivative - loop.Derivative);
+
+            float candidate = loop.Integral + error * dt;
+            if (candidate > IntegralLimit) candidate = IntegralLimit;
+            if (candidate < -IntegralLimit) candidate = -IntegralLimit;
+
+            float correction = kp * error + ki * candidate + kd * loop.Derivative;
+            float readingToDial = readingMax > 0.0001f ? dial.maxOutputValue / readingMax : 1f;
+
+            float wanted = DialValueFor(dial, target, readingMax) * feedForward + correction * readingToDial;
+
+            // If the reading has gone non-finite then so has everything derived from it. Drop the
+            // loop's memory of it and leave the dial alone rather than write the poison through.
+            if (IsBad(wanted) || IsBad(candidate))
+            {
+                loop.Reset();
+                return;
+            }
+            float clamped = wanted;
+            if (dial.minOutputValue < dial.maxOutputValue)
+            {
+                if (clamped < dial.minOutputValue) clamped = dial.minOutputValue;
+                if (clamped > dial.maxOutputValue) clamped = dial.maxOutputValue;
+            }
+
+            // Anti-windup: while the handle is pinned against a stop the loop can do nothing more
+            // in that direction, so the integral is left alone rather than run up.
+            if (Math.Abs(clamped - wanted) < 0.0001f)
+            {
+                loop.Integral = candidate;
+            }
+
+            SetDialRaw(dial, clamped);
+        }
+
+        // =================================================================================
         // Dial plumbing
-        // ---------------------------------------------------------------------------------
+        // =================================================================================
 
         private static void SetDialRaw(DialInteractable dial, float output)
         {
@@ -678,6 +823,15 @@ namespace EspressoAssistant
             {
                 if (output < dial.minOutputValue) output = dial.minOutputValue;
                 if (output > dial.maxOutputValue) output = dial.maxOutputValue;
+            }
+
+            // A non-finite value must never reach a dial. The game compares the dial's value to its
+            // limits, and every comparison against NaN is false, so a NaN written here leaves the
+            // dial in a state where nothing - including the player - can move it again. Only a
+            // freshly started game clears that.
+            if (IsBad(output))
+            {
+                return;
             }
 
             dial.accumulatedValue = output;
@@ -699,117 +853,196 @@ namespace EspressoAssistant
             }
         }
 
-        private static float BaseDialValue(DialInteractable dial, float idealMapped)
-        {
-            return dial == null ? 0f : idealMapped * dial.maxOutputValue;
-        }
-
-        private static void Control(DialInteractable dial, float readingTarget, float actualReading,
-                                    float readingMax, float kp, float ki, float kd, LoopState loop, float dt)
+        /// <summary>The handle position that corresponds to a reading, in the dial's own units.</summary>
+        private static float DialValueFor(DialInteractable dial, float reading, float readingMax)
         {
             if (dial == null)
+            {
+                return 0f;
+            }
+            float mapped = readingMax > 0.0001f ? reading / readingMax : 0f;
+            return mapped * dial.maxOutputValue;
+        }
+
+        // =================================================================================
+        // Brew handle
+        // =================================================================================
+
+        /// <summary>
+        /// Clicks the brew handle the way the game's own cursor would, then checks the machine and
+        /// clicks again if nothing happened. The handle is a latching switch that can end up out of
+        /// step with the machine, so the machine's own state is what counts, not the handle's.
+        /// </summary>
+        /// <summary>
+        /// Presses the brew handle once, to throw it back off.
+        /// <para>
+        /// Deliberately unconditional, and deliberately not asked to check anything first. The handle
+        /// carries no field that says where the lever is - isActive reads true whether it is up or
+        /// down, because its position lives in an animation - so the only trustworthy record that it
+        /// was left thrown is this mod's own. Call it only where the automation knows that is the
+        /// case; it is a toggle, and a click in the wrong circumstances would throw it down instead.
+        /// </para>
+        /// </summary>
+        private void ResetBrewHandle(EspressoBrewingController machine)
+        {
+            LookAtTarget handle = machine != null ? machine.brewButton : null;
+            if (handle == null)
             {
                 return;
             }
 
-            float error = readingTarget - actualReading;
-
-            float rawDerivative = loop.HasPrevious ? (error - loop.PreviousError) / dt : 0f;
-            loop.PreviousError = error;
-            loop.HasPrevious = true;
-            float alpha = dt / (DerivativeFilterSeconds + dt);
-            loop.Derivative += alpha * (rawDerivative - loop.Derivative);
-
-            float candidate = loop.Integral + error * dt;
-            if (candidate > IntegralLimit) candidate = IntegralLimit;
-            if (candidate < -IntegralLimit) candidate = -IntegralLimit;
-
-            float correction = kp * error + ki * candidate + kd * loop.Derivative;
-            float readingToDial = readingMax > 0.0001f ? dial.maxOutputValue / readingMax : 1f;
-            float targetMapped = readingMax > 0.0001f ? readingTarget / readingMax : 0f;
-
-            float wanted = BaseDialValue(dial, targetMapped) + correction * readingToDial;
-            float clamped = wanted;
-            if (dial.minOutputValue < dial.maxOutputValue)
+            try
             {
-                if (clamped < dial.minOutputValue) clamped = dial.minOutputValue;
-                if (clamped > dial.maxOutputValue) clamped = dial.maxOutputValue;
-            }
+                Interactable target = handle.interactable;
+                handle.UpdateHover(true, true);
+                handle.HandleClickDownFromManager(target);
+                handle.HandleClickUpFromManager(target);
 
-            // Anti-windup: while the handle is pinned against a stop the loop cannot do anything
-            // more in that direction, so the integral is left alone. Letting it keep climbing is
-            // what drove the handle to zero the moment a shot began.
-            if (Math.Abs(clamped - wanted) < 0.0001f)
+                // It is a toggle, so check the click did not land the other way and start a shot.
+                string after = StateOf(machine);
+                if (after == "Brewing")
+                {
+                    LoggerInstance.Warning("[ESPRESSO] The handle reset landed the wrong way and started a brew; " +
+                                           "putting it back again.");
+                    ClickBrewHandle(machine, false, "undo the accidental start");
+                }
+                else
+                {
+                    LoggerInstance.Msg("[ESPRESSO] Brew handle put back (it had been left thrown); machine reads " + after + ".");
+                }
+            }
+            catch (Exception e)
             {
-                loop.Integral = candidate;
+                LoggerInstance.Warning("[ESPRESSO] could not put the brew handle back: " + e.Message);
             }
-
-            SetDialRaw(dial, clamped);
         }
 
-        // ---------------------------------------------------------------------------------
+        private void ClickBrewHandle(EspressoBrewingController machine, bool wantBrewing, string why)
+        {
+            LookAtTarget handle = machine.brewButton;
+            if (handle == null)
+            {
+                LoggerInstance.Warning("[ESPRESSO] Brew handle not found; cannot " + why + ".");
+                return;
+            }
+
+            string before = StateOf(machine);
+            if ((before == "Brewing") == wantBrewing)
+            {
+                LoggerInstance.Msg("[ESPRESSO] no click needed (" + why + "): machine already " + before);
+                return;
+            }
+
+            try
+            {
+                Interactable target = handle.interactable;
+
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    handle.UpdateHover(true, true);
+                    handle.HandleClickDownFromManager(target);
+                    handle.HandleClickUpFromManager(target);
+
+                    string after = StateOf(machine);
+                    LoggerInstance.Msg("[ESPRESSO] click " + attempt + " (" + why + "): " + before + " -> " + after);
+
+                    if ((after == "Brewing") == wantBrewing)
+                    {
+                        return;
+                    }
+                }
+
+                LoggerInstance.Warning("[ESPRESSO] the handle would not " + why + " after three clicks (" + StateOf(machine) + ").");
+            }
+            catch (Exception e)
+            {
+                LoggerInstance.Error("[ESPRESSO] Could not click the brew handle: " + e);
+            }
+        }
+
+        // =================================================================================
         // Reporting
-        // ---------------------------------------------------------------------------------
+        // =================================================================================
 
         private void ReportResult(EspressoBrewingController machine)
         {
-            // Read the cup first: collecting it empties the slot, and reading afterwards is why
-            // every report so far said "no cup".
-            Gains gains = FinalGains;
             EspressoCup cup = machine._loadedCup;
 
-            float tempMean = _errSamples > 0 ? _tempAbsErrSum / _errSamples : 0f;
-            float pressureMean = _errSamples > 0 ? _pressureAbsErrSum / _errSamples : 0f;
-
-            string cupText = cup == null
+            string cupText = cup == null || !cup.IsInitialised
                 ? "no cup"
                 : ("quality=" + safe(cup.Quality).ToString("0.0") +
                    " temp=" + safe(cup.TemperatureScore).ToString("0.0") +
                    " pressure=" + safe(cup.PressureScore).ToString("0.0") +
                    " timing=" + safe(cup.TimingScore).ToString("0.0"));
 
-            LoggerInstance.Msg("[TUNE] preset [" + gains.Label + "] -> " + cupText +
-                               " | tempErr mean=" + tempMean.ToString("0.00") + " max=" + _tempMaxErr.ToString("0.00") +
-                               " | pressureErr mean=" + pressureMean.ToString("0.000") + " max=" + _pressureMaxErr.ToString("0.000") +
-                               " | samples=" + _errSamples);
+            // Diagnostic. The cup's grade is decided by four thresholds that live on the cup prefab
+            // rather than in code, so printing them settles where a "Perfect" grade on a mediocre cup
+            // actually comes from instead of leaving it to guesswork.
+            if (cup != null && cup.IsInitialised)
+            {
+                try
+                {
+                    LoggerInstance.Msg("[GRADE] grade='" + (cup.QualityGrade ?? "?") +
+                                       "' quality=" + safe(cup.Quality).ToString("0.00") +
+                                       " | thresholds perfect=" + cup.gradePerfectThreshold.ToString("0.00") +
+                                       " good=" + cup.gradeGoodThreshold.ToString("0.00") +
+                                       " acceptable=" + cup.gradeAcceptableThreshold.ToString("0.00") +
+                                       " poor=" + cup.gradePoorThreshold.ToString("0.00"));
+                }
+                catch (Exception e)
+                {
+                    LoggerInstance.Warning("[GRADE] could not read the grade fields: " + e.Message);
+                }
+            }
 
-            // The cup is deliberately left alone. An earlier version emptied it to keep an
-            // automatic run going, which threw away the coffee the player had just made.
+            if (cup != null && cup.IsInitialised)
+            {
+                _hasLastResult = true;
+                _lastQuality = safe(cup.Quality);
+                _lastTempScore = safe(cup.TemperatureScore);
+                _lastPressureScore = safe(cup.PressureScore);
+                _lastTimingScore = safe(cup.TimingScore);
+            }
+            _lastBrewTempMean = Mean(_brewTempAbsErr, _brewSamples);
+            _lastBrewTempMax = _brewTempMaxErr;
+            _lastBrewPressureMean = Mean(_brewPressureAbsErr, _brewSamples);
+            _lastBrewPressureMax = _brewPressureMaxErr;
+
+            LoggerInstance.Msg("[RESULT] " + cupText +
+                               " | BREW err mean temp=" + Mean(_brewTempAbsErr, _brewSamples).ToString("0.00") +
+                               " max=" + _brewTempMaxErr.ToString("0.00") +
+                               " pressure=" + Mean(_brewPressureAbsErr, _brewSamples).ToString("0.000") +
+                               " max=" + _brewPressureMaxErr.ToString("0.000") +
+                               " samples=" + _brewSamples +
+                               " | gains T " + GainText(BrewGains.TempKp, BrewGains.TempKi, BrewGains.TempKd) +
+                               " P " + GainText(BrewGains.PressureKp, BrewGains.PressureKi, BrewGains.PressureKd));
         }
 
-        private void LogDialInventory(EspressoBrewingController machine)
+        private static string GainText(float kp, float ki, float kd)
         {
-            if (_loggedDialInventory >= 1)
-            {
-                return;
-            }
-            _loggedDialInventory++;
-
-            try
-            {
-                LoggerInstance.Msg("[ESPRESSO] idealTemp=" + safe(machine.idealTemperature).ToString("0.00") +
-                                   " idealPressure=" + safe(machine.idealPressure).ToString("0.000") +
-                                   " idealSeconds=" + safe(machine.idealBrewSeconds).ToString("0.00") +
-                                   " tempMax=" + safe(machine.tempMax).ToString("0.00") +
-                                   " pressureMax=" + safe(machine.pressureMax).ToString("0.000"));
-            }
-            catch
-            {
-                // Diagnostics only.
-            }
+            return kp.ToString("0.##") + "/" + ki.ToString("0.##") + "/" + kd.ToString("0.##");
         }
 
-        // ---------------------------------------------------------------------------------
-        // Status panel
-        // ---------------------------------------------------------------------------------
+        /// <summary>Arrival time as text; "-" means the reading never got inside the band.</summary>
+        private static string Arrival(float seconds)
+        {
+            return seconds < 0f ? "-" : seconds.ToString("0.0") + "s";
+        }
+
+        private static float Mean(float sum, int count)
+        {
+            return count > 0 ? sum / count : 0f;
+        }
+
+        // =================================================================================
+        // Status panel - visible only while working a shot
+        // =================================================================================
 
         public override void OnGUI()
         {
             try
             {
-                // Only shown while the assistant is actually working a shot. The rest of the
-                // time the screen is left completely alone.
-                if (!_preheating && !_assistActive)
+                if (!_preheating && !_brewing)
                 {
                     return;
                 }
@@ -820,46 +1053,54 @@ namespace EspressoAssistant
                     return;
                 }
 
-                EspressoCup cup = machine._loadedCup;
-                bool showCup = cup != null && cup.IsInitialised;
-
-                const float width = 330f;
+                const float width = 390f;
                 const float margin = 20f;
-                const float lineHeight = 24f;
+                const float lineHeight = 22f;
+                const float rows = 6f;
 
-                float rows = showCup ? 5f : 4f;
-                Rect box = new Rect(Screen.width - width - margin, margin, width, 42f + rows * lineHeight);
-                GUI.Box(box, "\u5496\u5561\u673a\u52a9\u624b (F10)");
+                Rect box = new Rect(Screen.width - width - margin, margin, width, 42f + rows * lineHeight + 6f);
+                GUI.Box(box, "\u5496\u5561\u673a\u52a9\u624b V1.1.0 (F10)");
 
                 float lx = box.x + 10f;
                 float lw = box.width - 20f;
-                float ly = box.y + 25f;
+                float ly = box.y + 24f;
 
-                Line(lx, lw, ref ly, "\u72b6\u6001\uff1a" + (_preheating ? "\u9884\u70ed\u4e2d" : "\u51b2\u716e\u4e2d"),
+                Line(lx, lw, ref ly, "\u9636\u6bb5\uff1a" + (_preheating ? "\u9884\u70ed\u4e2d" : "\u51b2\u716e\u4e2d") +
+                                     "    \u5df2\u5b8c\u6210 " + _runsCompleted + " \u676f",
                      _preheating ? new Color(1f, 0.9f, 0.5f) : new Color(0.6f, 1f, 0.6f));
 
-                float tempDiff = Math.Abs(safe(machine.simTemperature) - safe(machine.idealTemperature));
-                Line(lx, lw, ref ly, "\u6e29\u5ea6\uff1a" + safe(machine.simTemperature).ToString("0.0") +
-                                     " / " + safe(machine.idealTemperature).ToString("0.0") +
-                                     "   " + tempDiff.ToString("0.00"),
+                // The target shown is the one the current stage is actually working to: warning
+                // holds both readings on the ideals, brewing works to them directly.
+                float tempTarget = safe(machine.idealTemperature) + (_preheating ? Current.PreheatTempOffset : 0f);
+                float pressureTarget = safe(machine.idealPressure) + (_preheating ? Current.PreheatPressureOffset : 0f);
+
+                float tempDiff = Math.Abs(safe(machine.simTemperature) - tempTarget);
+                Line(lx, lw, ref ly, "\u6e29\u5ea6 " + safe(machine.simTemperature).ToString("0.00") +
+                                     " / " + tempTarget.ToString("0.00") + "   \u8bef\u5dee " + tempDiff.ToString("0.00"),
                      tempDiff <= 1f ? new Color(0.55f, 1f, 0.55f) : new Color(1f, 0.85f, 0.5f));
 
-                float pressureDiff = Math.Abs(safe(machine.simPressure) - safe(machine.idealPressure));
-                Line(lx, lw, ref ly, "\u538b\u529b\uff1a" + safe(machine.simPressure).ToString("0.000") +
-                                     " / " + safe(machine.idealPressure).ToString("0.000") +
-                                     "   " + pressureDiff.ToString("0.000"),
+                float pressureDiff = Math.Abs(safe(machine.simPressure) - pressureTarget);
+                Line(lx, lw, ref ly, "\u538b\u529b " + safe(machine.simPressure).ToString("0.000") +
+                                     " / " + pressureTarget.ToString("0.000") + "   \u8bef\u5dee " + pressureDiff.ToString("0.000"),
                      pressureDiff <= 0.2f ? new Color(0.55f, 1f, 0.55f) : new Color(1f, 0.85f, 0.5f));
 
-                Line(lx, lw, ref ly, "\u65f6\u95f4\uff1a" + safe(machine.BrewElapsedSeconds).ToString("0.00") + "s / " +
+                Line(lx, lw, ref ly, "\u65f6\u95f4 " + safe(machine.BrewElapsedSeconds).ToString("0.00") + "s / " +
                                      safe(machine.idealBrewSeconds).ToString("0.00") + "s", null);
 
-                if (showCup)
+                Line(lx, lw, ref ly, "\u8f6c\u76d8 \u6e29 " + DialText(machine.temperatureDial) + "  \u538b " + DialText(machine.pressureDial) +
+                                     "   \u624b\u67c4 " + (machine.brewButton != null && machine.brewButton.isActive ? "ON" : "off"), null);
+
+                if (_hasLastResult)
                 {
-                    Line(lx, lw, ref ly, "\u6210\u676f\uff1a" + safe(cup.Quality).ToString("0.0") +
-                                         "\uff08\u6e29 " + safe(cup.TemperatureScore).ToString("0.0") +
-                                         "  \u538b " + safe(cup.PressureScore).ToString("0.0") +
-                                         "  \u65f6 " + safe(cup.TimingScore).ToString("0.0") + "\uff09",
-                         new Color(0.7f, 1f, 1f));
+                    Line(lx, lw, ref ly, "\u4e0a\u676f\u54c1\u8d28 " + _lastQuality.ToString("0.0") +
+                                         "  (\u6e29 " + _lastTempScore.ToString("0.0") +
+                                         " \u538b " + _lastPressureScore.ToString("0.0") +
+                                         " \u65f6 " + _lastTimingScore.ToString("0.0") + ")",
+                         new Color(0.7f, 1f, 0.7f));
+                }
+                else
+                {
+                    Line(lx, lw, ref ly, "\u4e0a\u676f\u54c1\u8d28 \u5c1a\u65e0", null);
                 }
             }
             catch
@@ -880,14 +1121,38 @@ namespace EspressoAssistant
             y += 24f;
         }
 
+        // =================================================================================
+        // Helpers
+        // =================================================================================
+
         private static string DialText(DialInteractable dial)
         {
             return dial == null ? "n/a" : dial.accumulatedValue.ToString("0.00");
         }
 
+        /// <summary>
+        /// Hands back a usable number. Non-finite values are reported as zero so the arithmetic
+        /// downstream cannot spread them - but note that this <b>hides</b> them, so anything meant to
+        /// diagnose a machine should print the raw value instead (see <see cref="Raw"/>).
+        /// </summary>
         private static float safe(float value)
         {
-            return float.IsNaN(value) || float.IsInfinity(value) ? 0f : value;
+            return IsBad(value) ? 0f : value;
+        }
+
+        /// <summary>True for the values that quietly poison everything they touch: NaN and the infinities.</summary>
+        private static bool IsBad(float value)
+        {
+            return float.IsNaN(value) || float.IsInfinity(value);
+        }
+
+        /// <summary>Prints a float honestly, so a non-finite value reads as one instead of as zero.</summary>
+        private static string Raw(float value)
+        {
+            if (float.IsNaN(value)) return "NaN";
+            if (float.IsPositiveInfinity(value)) return "+Inf";
+            if (float.IsNegativeInfinity(value)) return "-Inf";
+            return value.ToString("0.000");
         }
 
         private static string StateOf(EspressoBrewingController machine)
@@ -902,16 +1167,34 @@ namespace EspressoAssistant
             }
         }
 
+        /// <summary>
+        /// The espresso machine that is actually running, or null.
+        /// <para>
+        /// FindObjectsOfTypeAll also hands back uninstantiated templates and objects belonging to
+        /// scenes that are no longer loaded. Driving one of those does nothing at all - its readings
+        /// stay at zero and its dials at whatever the asset was authored with - so a live, active
+        /// object is the only thing worth returning.
+        /// </para>
+        /// </summary>
         private static EspressoBrewingController FindMachine()
         {
             try
             {
                 foreach (EspressoBrewingController machine in Resources.FindObjectsOfTypeAll<EspressoBrewingController>())
                 {
-                    if (machine != null && machine.gameObject != null)
+                    if (machine == null || machine.gameObject == null)
                     {
-                        return machine;
+                        continue;
                     }
+                    if (!machine.gameObject.scene.IsValid() || !machine.gameObject.scene.isLoaded)
+                    {
+                        continue;   // a template, or left over from a scene that has been unloaded
+                    }
+                    if (!machine.gameObject.activeInHierarchy)
+                    {
+                        continue;
+                    }
+                    return machine;
                 }
             }
             catch
@@ -919,6 +1202,74 @@ namespace EspressoAssistant
                 // Falls through to null.
             }
             return null;
+        }
+
+        /// <summary>
+        /// Whatever the machine is missing before a shot is worth running, as text - empty when it
+        /// has everything. The game calls itself Ready with either the cup or the grounds missing,
+        /// and a shot brewed into an empty machine only burns the heat and the water.
+        /// </summary>
+        private static string MissingSupplies(EspressoBrewingController machine)
+        {
+            try
+            {
+                bool hasCup = machine != null && machine.cupSlot != null && machine.cupSlot.HasItem;
+                bool hasGrounds = machine != null && machine.groundsSlot != null && machine.groundsSlot.HasItem;
+
+                if (hasCup && hasGrounds)
+                {
+                    return "";
+                }
+                if (!hasCup && !hasGrounds)
+                {
+                    return "a cup and coffee grounds";
+                }
+                return hasCup ? "coffee grounds" : "a cup";
+            }
+            catch
+            {
+                return "";   // cannot tell - never block the player over that
+            }
+        }
+
+        /// <summary>Stops whatever run is in progress, leaving the machine exactly as it is.</summary>
+        private void AbandonRun()
+        {
+            _suspended = false;
+            _reportedBadReading = false;
+            _preheating = false;
+            _brewing = false;
+            _sawBrewing = false;
+            _stopped = false;
+            RestoreDialCentre(FindMachine());
+        }
+
+        /// <summary>
+        /// Puts the remembered clamp centre back on both dials. Called whenever a run ends, however
+        /// it ends, so the machine is handed back the way it was found.
+        /// </summary>
+        private void RestoreDialCentre(EspressoBrewingController machine)
+        {
+            if (!_clampSaved)
+            {
+                return;
+            }
+            _clampSaved = false;
+
+            if (machine == null)
+            {
+                return;
+            }
+            try
+            {
+                if (machine.temperatureDial != null) machine.temperatureDial.clampCenterValue = _tempDialClampSaved;
+                if (machine.pressureDial != null) machine.pressureDial.clampCenterValue = _pressureDialClampSaved;
+                LoggerInstance.Msg("[ESPRESSO] Dial clamp centres restored.");
+            }
+            catch
+            {
+                // Nothing here is worth an error.
+            }
         }
     }
 }

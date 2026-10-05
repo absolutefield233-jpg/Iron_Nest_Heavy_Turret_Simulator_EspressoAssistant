@@ -1,0 +1,13 @@
+# build output
+bin/
+obj/
+
+# local scratch: patch scripts, snapshots, backups
+_dev/
+snapshots/
+_release/
+*.cs.bak
+*.dll.bak
+
+# packages
+*.zip

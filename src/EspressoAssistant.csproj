@@ -12,7 +12,9 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <NoWarn>CS0436;CS1701;CS1702;NU1701</NoWarn>
-    <GameDir>D:\steam\steamapps\common\Iron Nest Heavy Turret Simulator</GameDir>
+    <!-- Point this at your own install, or pass it on the command line:
+         dotnet build -c Release -p:GameDir="X:\path\to\Iron Nest Heavy Turret Simulator" -->
+    <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Iron Nest Heavy Turret Simulator</GameDir>
   </PropertyGroup>
 
   <ItemGroup>
