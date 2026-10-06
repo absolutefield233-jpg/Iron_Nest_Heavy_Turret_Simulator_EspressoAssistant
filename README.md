@@ -8,15 +8,6 @@
 **实测成绩：品质 100.0（温度 100.0 / 压力 100.0 / 时机 100.0）** —— 包括**冷机第一杯**。
 **冲煮过程中切出游戏再回来，它会接着把这一杯冲完**（实测切出去 94 秒回来仍是 100.0）。
 
-### 相比 V1.1.0
-
-- **停冲改成了"落在离理想时刻最近的那一帧"**。之前是"等时钟过了才停"，**永远晚、最多晚一整帧**；
-  帧率一掉（关卡里单位变多）偏差就变大、时机分就往下掉。现在会**提前半帧发令**，
-  让停冲落点正好压在理想时刻两边 —— 时机分从 99.6–99.9 提到 **99.8–100.0**，
-  五杯里两杯直接给 **100.0**。
-- **日志精简**。正式版每次冲煮只写一行成绩，其余只有在真正出问题时才提示；
-  上一版的调试输出（逐帧数值、评分参数、评级诊断）已全部移除。
-
 ---
 
 ## 一、前置要求（必须先满足，否则装了也不生效）
@@ -195,6 +186,7 @@ dotnet build -c Release -p:GameDir="X:\path\to\Iron Nest Heavy Turret Simulator"
 - 随意使用、修改、再发布。
 
 ---
+
 ---
 
 # Espresso Assistant (English)
@@ -207,16 +199,6 @@ first shot from a cold machine. **If you tab out mid-shot, it picks the shot bac
 return** (94 seconds in the background was measured, and it still finished at 100.0).
 
 **V1.1.1 · by 4Dfish**
-
-### Since V1.1.0
-
-- **The stop now lands on whichever frame sits closest to the ideal**, instead of waiting until the
-  clock has already gone past it. Waiting was always late by up to a whole frame, and the lateness
-  grew as the frame rate dropped — which is why the timing score fell away in busier scenes. Asking
-  half a frame early puts the stop on either side of the mark: timing went from 99.6–99.9 to
-  **99.8–100.0**, with two of five test shots scoring a flat 100.0.
-- **The log is quiet now.** A released build writes one line per shot and otherwise only speaks up
-  when something is actually wrong; the previous build's diagnostics have all been removed.
 
 ## Prerequisites
 
