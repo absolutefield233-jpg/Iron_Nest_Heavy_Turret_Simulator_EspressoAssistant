@@ -1,12 +1,21 @@
 # Espresso Assistant · 咖啡机助手
 
-**V1.1.0 · by 4Dfish**
+**V1.1.1 · by 4Dfish**
 
 一个给《铁巢重炮 / Iron Nest: Heavy Turret Simulator》的 MelonLoader mod：
 让游戏里的意式咖啡机**稳定出一杯满分的咖啡**，不用再跟温度盘、压力盘、时机三个东西斗智斗勇。
 
 **实测成绩：品质 100.0（温度 100.0 / 压力 100.0 / 时机 100.0）** —— 包括**冷机第一杯**。
 **冲煮过程中切出游戏再回来，它会接着把这一杯冲完**（实测切出去 94 秒回来仍是 100.0）。
+
+### 相比 V1.1.0
+
+- **停冲改成了"落在离理想时刻最近的那一帧"**。之前是"等时钟过了才停"，**永远晚、最多晚一整帧**；
+  帧率一掉（关卡里单位变多）偏差就变大、时机分就往下掉。现在会**提前半帧发令**，
+  让停冲落点正好压在理想时刻两边 —— 时机分从 99.6~99.9 提到 **99.8~100.0**，
+  五杯里两杯直接给 **100.0**。
+- **日志精简**。正式版每次冲煮只写一行成绩，其余只有在真正出问题时才提示；
+  上一版的调试输出（逐帧数值、评分参数、评级诊断）已全部移除。
 
 ---
 
@@ -117,6 +126,12 @@
   机器升温速度约 11 °C/秒是固定的，从冷机烧到 93 °C 物理上就要这么久，任何 mod 都改不了。
   **连续冲第二杯起只需 2~3 秒。**
 
+- **时机分摸不到 100.0，这是游戏的记录方式决定的。**
+  游戏只肯在**帧的边界**上记录停冲时刻（相邻两帧之间发生什么它记不到），所以停冲落点最多只能
+  压到"半帧"的精度。帧率 50 fps 时半帧是 10 毫秒，时机分的上限就是 **99.75**；
+  跑到 100.0 需要恰好有一帧落在理想时刻上——**那是运气，不是控制精度**。
+  帧率越低上限越低，这一点任何 mod 都改不了。
+
 - **游戏面板上的"Perfect"评语不可靠。**
   游戏是用 `Quality` 去比四条固定分数线来评级的，而那四条线是
   `Perfect=9 / Good=7 / Acceptable=5 / Poor=3`，可 `Quality` 是 **0~100 的百分数**——
@@ -191,7 +206,17 @@ from the in-game espresso machine every time, instead of being a fight with two 
 first shot from a cold machine. **If you tab out mid-shot, it picks the shot back up when you
 return** (94 seconds in the background was measured, and it still finished at 100.0).
 
-**V1.1.0 · by 4Dfish**
+**V1.1.1 · by 4Dfish**
+
+### Since V1.1.0
+
+- **The stop now lands on whichever frame sits closest to the ideal**, instead of waiting until the
+  clock has already gone past it. Waiting was always late by up to a whole frame, and the lateness
+  grew as the frame rate dropped — which is why the timing score fell away in busier scenes. Asking
+  half a frame early puts the stop on either side of the mark: timing went from 99.6–99.9 to
+  **99.8–100.0**, with two of five test shots scoring a flat 100.0.
+- **The log is quiet now.** A released build writes one line per shot and otherwise only speaks up
+  when something is actually wrong; the previous build's diagnostics have all been removed.
 
 ## Prerequisites
 
@@ -248,6 +273,11 @@ Typical error: temperature 0.02–0.05 °C mean, 0.1–0.7 °C peak; pressure 0.
 
 - **A cold machine needs about ten seconds to warm.** Its heating rate is roughly 11 °C/s and that
   is fixed. Subsequent shots take 2–3 seconds.
+- **The timing score cannot reach 100.0, and that is the game's doing.** It only records the stop on a
+  **frame boundary** — whatever happens between two frames is invisible to it — so the best any
+  automation can manage is "half a frame". At 50 fps that is 10 ms, which caps the timing score at
+  **99.75**. Scoring a flat 100.0 needs a frame to land exactly on the ideal, which is luck rather
+  than precision. Lower frame rates lower the ceiling, and no mod can change that.
 - **The game's own "Perfect" grade word is not trustworthy.** The grade compares `Quality` against
   thresholds of `Perfect=9 / Good=7 / Acceptable=5 / Poor=3`, but `Quality` runs 0–100, so the bar
   for "Perfect" is effectively 9% and almost any cup passes. That is the game's own asset data,
