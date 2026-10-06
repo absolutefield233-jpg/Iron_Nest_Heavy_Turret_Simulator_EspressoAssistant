@@ -906,10 +906,10 @@ namespace EspressoAssistant
             _lastTimingScore = safe(cup.TimingScore);
             _hasLastResult = true;
 
-            LoggerInstance.Msg("[ESPRESSO] Cup read: quality " + _lastQuality.ToString("0.0") +
-                               "  (temperature " + _lastTempScore.ToString("0.0") +
-                               ", pressure " + _lastPressureScore.ToString("0.0") +
-                               ", timing " + _lastTimingScore.ToString("0.0") + ")");
+            LoggerInstance.Msg("[ESPRESSO] Cup read: quality " + _lastQuality.ToString("0.00") +
+                               "  (temperature " + _lastTempScore.ToString("0.00") +
+                               ", pressure " + _lastPressureScore.ToString("0.00") +
+                               ", timing " + _lastTimingScore.ToString("0.00") + ")");
         }
 
         // =================================================================================
@@ -970,10 +970,10 @@ namespace EspressoAssistant
 
                 if (_hasLastResult)
                 {
-                    Line(lx, lw, ref ly, "\u4e0a\u676f\u54c1\u8d28 " + _lastQuality.ToString("0.0") +
-                                         "  (\u6e29 " + _lastTempScore.ToString("0.0") +
-                                         " \u538b " + _lastPressureScore.ToString("0.0") +
-                                         " \u65f6 " + _lastTimingScore.ToString("0.0") + ")",
+                    Line(lx, lw, ref ly, "\u4e0a\u676f\u54c1\u8d28 " + _lastQuality.ToString("0.00") +
+                                         "  (\u6e29 " + _lastTempScore.ToString("0.00") +
+                                         " \u538b " + _lastPressureScore.ToString("0.00") +
+                                         " \u65f6 " + _lastTimingScore.ToString("0.00") + ")",
                          new Color(0.7f, 1f, 0.7f));
                 }
                 else

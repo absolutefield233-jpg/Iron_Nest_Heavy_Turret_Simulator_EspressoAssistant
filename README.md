@@ -3,10 +3,11 @@
 **V1.1.1 · by 4Dfish**
 
 一个给《铁巢重炮 / Iron Nest: Heavy Turret Simulator》的 MelonLoader mod：
-让游戏里的意式咖啡机**稳定出一杯满分的咖啡**，不用再跟温度盘、压力盘、时机三个东西斗智斗勇。
+让游戏里的意式咖啡机**稳定出一杯 99.9 分以上的咖啡**，不用再跟温度盘、压力盘、时机三个东西斗智斗勇。
 
-**实测成绩：品质 100.0（温度 100.0 / 压力 100.0 / 时机 100.0）** —— 包括**冷机第一杯**。
-**冲煮过程中切出游戏再回来，它会接着把这一杯冲完**（实测切出去 94 秒回来仍是 100.0）。
+**实测成绩：品质 99.95–99.97**（两杯实测：温度 99.94 / 99.95，压力 99.98，时机 99.91 / 99.97）—— 包括**冷机第一杯**。
+**距满分差的那几个小数位是游戏自己的记录方式决定的，下面“已知限制”里有说明。**
+**冲煮过程中切出游戏再回来，它会接着把这一杯冲完**（实测切出去 94 秒回来仍是 99.9 分）。
 
 ---
 
@@ -191,12 +192,13 @@ dotnet build -c Release -p:GameDir="X:\path\to\Iron Nest Heavy Turret Simulator"
 
 # Espresso Assistant (English)
 
-A MelonLoader mod for **Iron Nest: Heavy Turret Simulator** that pulls a **perfect** shot
+A MelonLoader mod for **Iron Nest: Heavy Turret Simulator** that pulls a near-perfect shot
 from the in-game espresso machine every time, instead of being a fight with two dials and a timer.
 
-**Measured: quality 100.0 (temperature 100.0 / pressure 100.0 / timing 100.0)** — including the
-first shot from a cold machine. **If you tab out mid-shot, it picks the shot back up when you
-return** (94 seconds in the background was measured, and it still finished at 100.0).
+**Measured: quality 99.95–99.97** (two shots: temperature 99.94 / 99.95, pressure 99.98,
+timing 99.91 / 99.97) — including the first shot from a cold machine. **If you tab out mid-shot,
+it picks the shot back up when you return** (94 seconds in the background was measured, and it
+still finished at 99.9).
 
 **V1.1.1 · by 4Dfish**
 
